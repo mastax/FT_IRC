@@ -29,8 +29,8 @@ public:
     ~Server();
 
     // Prevent copying
-    Server(const Server& other) = delete;
-    Server& operator=(const Server& other) = delete;
+    Server(const Server& other);
+    Server& operator=(const Server& other);
 
     // Server operations
     bool setup();

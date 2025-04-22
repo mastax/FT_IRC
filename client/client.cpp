@@ -1,6 +1,6 @@
 #include "client.hpp"
 #include "../server/server.hpp"
-// #include "Channel.hpp"
+#include "../channels/channels.hpp"
 #include <iostream>
 #include <sstream>
 #include <algorithm>
@@ -231,6 +231,50 @@ void Client::handleCommand(const std::string& command, const std::vector<std::st
             sendData("464 :Password incorrect");
         }
     }
+    // Add this to Client::handleCommand
+    else if (command == "TOPIC") {
+        if (params.size() < 1) {
+            sendData("461 " + _nickname + " TOPIC :Not enough parameters");
+        return;
+    }
+    
+    std::string channelName = params[0];
+    Channel* channel = _server->getChannel(channelName);
+    
+    if (!channel) {
+        sendData("403 " + _nickname + " " + channelName + " :No such channel");
+        return;
+    }
+    
+    // Check if client is in the channel
+    if (!isInChannel(channel)) {
+        sendData("442 " + _nickname + " " + channelName + " :You're not on that channel");
+        return;
+    }
+    
+    // If no second parameter, return the topic
+    if (params.size() == 1) {
+        const std::string& topic = channel->getTopic();
+        if (!topic.empty()) {
+            sendData("332 " + _nickname + " " + channelName + " :" + topic);
+        } else {
+            sendData("331 " + _nickname + " " + channelName + " :No topic is set");
+        }
+        return;
+    }
+    
+    // Changing the topic - check if allowed
+    if (channel->isTopicRestricted() && !channel->isOperator(this)) {
+        sendData("482 " + _nickname + " " + channelName + " :You're not channel operator");
+        return;
+    }
+    
+    // Set the new topic
+    channel->setTopic(params[1]);
+    
+    // Notify all clients in the channel
+    channel->broadcastMessage(":" + _nickname + "!" + _username + "@host TOPIC " + channelName + " :" + params[1]);
+}
     else if (command == "NICK") {
         // Set nickname
         if (params.size() < 1) {
@@ -307,4 +351,5 @@ void Client::handleCommand(const std::string& command, const std::vector<std::st
         sendData("366 " + _nickname + " " + channelName + " :End of /NAMES list");
     }
     // Add more command handlers here (PRIVMSG, PART, QUIT, etc.)
+
 }

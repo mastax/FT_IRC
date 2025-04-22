@@ -1,12 +1,12 @@
-NAME = 
+NAME = ircserv
 
-SRC = 
+SRC = server/server.cpp client/client.cpp channels/channels.cpp main.cpp
 
 CFLAGS = -Wall -Wextra -Werror -std=c++98
 
 CC = c++
 
-HEADER = 
+HEADER = server/server.hpp client/client.hpp channels/channels.hpp
 
 OBJ=$(SRC:.cpp=.o)
 

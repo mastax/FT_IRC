@@ -1,6 +1,6 @@
 #include "server.hpp"
 #include "../client/client.hpp"
-#include "Channel.hpp"
+#include "../channels/channels.hpp"
 #include <iostream>
 #include <cstring>
 #include <fcntl.h>
