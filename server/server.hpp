@@ -23,11 +23,13 @@ private:
     std::vector<pollfd>     _pollfds;           // Collection of file descriptors for poll()
     std::map<int, Client*>  _clients;           // Connected clients (fd -> Client)
     std::map<std::string, Channel*> _channels;  // Available channels (name -> Channel)
+     bool _disconnected;
 
 public:
     Server(unsigned int port, const std::string& password);
     ~Server();
 
+    void Server::checkAndRemoveDisconnectedClients();
     // Prevent copying
     Server(const Server& other);
     Server& operator=(const Server& other);
@@ -49,12 +51,17 @@ public:
 
     // Password verification
     bool checkPassword(const std::string& password) const;
-
-private:
-    // Helper functions
     void handleNewConnection();
     void handleClientData(int clientFd);
     bool setNonBlocking(int fd);
+    bool isDisconnected() const {
+        return _disconnected;
+    }
+    
+    void setDisconnected() {
+        _disconnected = true;
+    }
+    // Helper functions
 };
 
 #endif // SERVER_HPP

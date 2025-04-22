@@ -20,6 +20,8 @@ private:
     bool _authenticated;        // Whether client is authenticated
     std::vector<Channel*> _channels;  // Channels the client has joined
     bool _isOperator;           // Whether client is a server operator
+    bool _disconnected;
+    // std::queue<std::string> _outgoingMessages; // For messages waiting to be sent
 
 public:
     Client(int fd, Server* server);
@@ -55,6 +57,15 @@ private:
     void processData();
     // Handle different IRC commands
     void handleCommand(const std::string& command, const std::vector<std::string>& params);
+    bool isDisconnected() const {
+        return _disconnected;
+    }
+    
+    void setDisconnected() {
+        _disconnected = true;
+    }
+    void Client::parseAndHandleCommand(const std::string& line);
+
 };
 
 #endif // CLIENT_HPP

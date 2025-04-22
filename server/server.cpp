@@ -33,9 +33,9 @@ bool Server::setup() {
     // Create socket
     _serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (_serverSocket == -1) {
-        std::cerr << "Error creating socket" << std::endl;
-        return false;
-    }
+        std::cerr << "Error creating socket: " << strerror(errno) << std::endl;
+    return false;
+}
 
     // Set socket options to reuse address
     int opt = 1;
@@ -82,38 +82,101 @@ bool Server::setup() {
     return true;
 }
 
+// In Server class, add a method to check and remove disconnected clients
+void Server::checkAndRemoveDisconnectedClients() {
+    std::vector<int> clientsToRemove;
+    
+    // First, identify clients that need to be removed
+    for (std::map<int, Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it) {
+        if (it->second->isDisconnected()) {
+            clientsToRemove.push_back(it->first);
+        }
+    }
+    
+    // Then remove them
+    for (size_t i = 0; i < clientsToRemove.size(); i++) {
+        removeClient(clientsToRemove[i]);
+    }
+}
+
+// Add to Client class:
+void Client::sendPendingData() {
+    while (!_outgoingMessages.empty()) {
+        std::string& message = _outgoingMessages.front();
+        
+        ssize_t bytesSent = send(_fd, message.c_str(), message.size(), 0);
+        
+        if (bytesSent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Would block, try again later
+                return;
+            }
+            // Error sending data
+            std::cerr << "Error sending data: " << strerror(errno) << std::endl;
+            setDisconnected();
+            return;
+        }
+        else if (static_cast<size_t>(bytesSent) < message.size()) {
+            // Partial send - keep remaining data
+            message = message.substr(bytesSent);
+            return;
+        }
+        else {
+            // Full message sent
+            _outgoingMessages.pop();
+        }
+    }
+}
+
+// Modify Server::run() to include checking for disconnected clients
 void Server::run() {
     while (true) {
-        // Wait for activity on one of the sockets (timeout -1 means wait indefinitely)
+        // Wait for activity on sockets
         int activity = poll(&_pollfds[0], _pollfds.size(), -1);
         
         if (activity < 0) {
-            std::cerr << "Poll error" << std::endl;
+            if (errno == EINTR) {
+                // Interrupted by signal, just continue
+                continue;
+            }
+            std::cerr << "Poll error: " << strerror(errno) << std::endl;
             break;
         }
         
-        // Check if there's activity on the server socket (new connection)
+        // Process server socket (new connections)
         if (_pollfds[0].revents & POLLIN) {
             handleNewConnection();
         }
         
-        // Check client sockets for activity
+        // Process client sockets
         for (size_t i = 1; i < _pollfds.size(); i++) {
-            if (_pollfds[i].revents & POLLIN) {
-                // Data available to read
-                handleClientData(_pollfds[i].fd);
+            int fd = _pollfds[i].fd;
+            
+            // Check for errors or hangup
+            if (_pollfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                Client* client = getClient(fd);
+                if (client) {
+                    client->setDisconnected();
+                }
+                continue;
             }
             
-            if (_pollfds[i].revents & POLLHUP) {
-                // Client disconnected
-                std::cout << "Client disconnected" << std::endl;
-                removeClient(_pollfds[i].fd);
-
-                // Remove from poll array
-                _pollfds.erase(_pollfds.begin() + i);
-                i--; // Adjust index after removal
+            // Check for data to read
+            if (_pollfds[i].revents & POLLIN) {
+                handleClientData(fd);
+            }
+            
+            // Check for ability to write (if client has pending data)
+            if (_pollfds[i].revents & POLLOUT) {
+                Client* client = getClient(fd);
+                if (client) {
+                    client->sendPendingData();
+                }
             }
         }
+        
+        // Check and cleanup disconnected clients
+        checkAndRemoveDisconnectedClients();
     }
 }
 
@@ -138,15 +201,48 @@ void Server::addClient(int clientFd) {
 }
 
 void Server::removeClient(int clientFd) {
-    // Find client in map
     std::map<int, Client*>::iterator it = _clients.find(clientFd);
     if (it != _clients.end()) {
+        // Get client's channels before deletion
+        const std::vector<Channel*>& channels = it->second->getChannels();
+        
+        // Make a copy since the vector will be modified during channel operations
+        std::vector<Channel*> channelsCopy(channels.begin(), channels.end());
+        
+        // Notify each channel about the client leaving
+        for (std::vector<Channel*>::iterator chanIt = channelsCopy.begin(); 
+             chanIt != channelsCopy.end(); ++chanIt) {
+            
+            Channel* channel = *chanIt;
+            // Broadcast quit message to channel members
+            channel->broadcastMessage(":" + it->second->getNickname() + 
+                                   "!" + it->second->getUsername() + 
+                                   "@host QUIT :Connection closed");
+            
+            // Remove client from channel
+            it->second->leaveChannel(channel);
+            
+            // If channel becomes empty, remove it
+            if (channel->getClients().empty()) {
+                removeChannel(channel->getName());
+            }
+        }
+        
+        // Delete client object
         delete it->second;
         _clients.erase(it);
     }
     
     // Close socket
     close(clientFd);
+    
+    // Remove from poll array
+    for (size_t i = 0; i < _pollfds.size(); i++) {
+        if (_pollfds[i].fd == clientFd) {
+            _pollfds.erase(_pollfds.begin() + i);
+            break;
+        }
+    }
 }
 
 Client* Server::getClient(int clientFd) {
@@ -197,9 +293,13 @@ void Server::handleNewConnection() {
     int clientFd = accept(_serverSocket, (struct sockaddr*)&clientAddr, &clientAddrLen);
     
     if (clientFd < 0) {
-        std::cerr << "Error accepting connection" << std::endl;
-        return;
+    // Handle EAGAIN/EWOULDBLOCK separately as they're expected for non-blocking sockets
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return; // No connections available, not an error
     }
+    std::cerr << "Error accepting connection: " << strerror(errno) << std::endl;
+    return;
+}
     
     // Set non-blocking mode
     if (!setNonBlocking(clientFd)) {

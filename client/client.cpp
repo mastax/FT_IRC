@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <cstring>
 
+
 // Utility function to split a string by delimiters
 std::vector<std::string> split(const std::string& s, char delimiter) {
     std::vector<std::string> tokens;
@@ -19,8 +20,9 @@ std::vector<std::string> split(const std::string& s, char delimiter) {
 }
 
 Client::Client(int fd, Server* server)
-    : _fd(fd), _server(server), _authenticated(false), _isOperator(false) {
-}
+        : _fd(fd), _server(server), _authenticated(false), _isOperator(false), _disconnected(false) {
+    }
+    
 
 Client::~Client() {
     // Leave all channels
@@ -98,15 +100,18 @@ const std::vector<Channel*>& Client::getChannels() const {
 }
 
 bool Client::receiveData() {
-    char buffer[1024];
+    char buffer[4096]; // Larger buffer
     ssize_t bytesRead = recv(_fd, buffer, sizeof(buffer) - 1, 0);
     
     if (bytesRead <= 0) {
         if (bytesRead == 0) {
             // Connection closed
-            std::cout << "Client disconnected" << std::endl;
+            std::cout << "Client " << _nickname << " disconnected" << std::endl;
         } else {
-            // Error
+            // Error reading
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return true; // Not an error, just no data available
+            }
             std::cerr << "Error receiving data: " << strerror(errno) << std::endl;
         }
         return false;
@@ -115,86 +120,88 @@ bool Client::receiveData() {
     buffer[bytesRead] = '\0';
     _buffer += buffer;
     
-    // Process commands that end with \r\n
-    size_t pos;
-    while ((pos = _buffer.find("\r\n")) != std::string::npos) {
-        std::string command = _buffer.substr(0, pos);
-        _buffer.erase(0, pos + 2); // Remove command and \r\n from buffer
-        
-        std::cout << "Received command: " << command << std::endl;
-        processData();
-    }
+    // Process complete commands
+    processData();
     
     return true;
 }
 
 void Client::sendData(const std::string& message) {
     std::string fullMessage = message + "\r\n";
+    // In Client::sendData()
     ssize_t bytesSent = send(_fd, fullMessage.c_str(), fullMessage.size(), 0);
-    
     if (bytesSent < 0) {
-        std::cerr << "Error sending data to client" << std::endl;
-    }
-}
-
-void Client::processData() {
-    // Example of processing IRC commands
-    // This is simplified - you'd need to implement RFC 1459 properly
-    
-    size_t pos = _buffer.find("\r\n");
-    if (pos == std::string::npos) {
-        return; // No complete command yet
-    }
-    
-    std::string line = _buffer.substr(0, pos);
-    _buffer.erase(0, pos + 2); // Remove processed command
-    
-    // Skip empty lines
-    if (line.empty()) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // Would block, need to buffer this message for later sending
+        // Add to outgoing message queue (implement this)
+            _outgoingMessages.push_back(fullMessage);
         return;
     }
-    
+    std::cerr << "Error sending data to client: " << strerror(errno) << std::endl;
+    // Consider flagging client for disconnection
+    return;
+    }
+    else if (static_cast<size_t>(bytesSent) < fullMessage.size()) {
+    // Partial send - buffer remaining data
+    _outgoingMessages.push_back(fullMessage.substr(bytesSent));
+}
+}
+
+void Client::parseAndHandleCommand(const std::string& line) {
     // Parse command
+    std::string prefix = "";
     std::string command;
     std::vector<std::string> params;
     
+    // Extract prefix if present
+    size_t start = 0;
     if (line[0] == ':') {
-        // Command with prefix (we'll ignore the prefix for now)
-        size_t spacePos = line.find(' ');
-        if (spacePos == std::string::npos) {
+        size_t prefixEnd = line.find(' ');
+        if (prefixEnd == std::string::npos) {
             return; // Invalid format
         }
-        
-        line = line.substr(spacePos + 1);
+        prefix = line.substr(1, prefixEnd - 1);
+        start = prefixEnd + 1;
+        while (start < line.size() && line[start] == ' ') {
+            start++;
+        }
     }
     
     // Extract command
-    size_t spacePos = line.find(' ');
-    if (spacePos == std::string::npos) {
-        command = line;
+    size_t cmdEnd = line.find(' ', start);
+    if (cmdEnd == std::string::npos) {
+        command = line.substr(start);
     } else {
-        command = line.substr(0, spacePos);
+        command = line.substr(start, cmdEnd - start);
         
         // Extract parameters
-        std::string paramsStr = line.substr(spacePos + 1);
+        size_t paramStart = cmdEnd + 1;
+        while (paramStart < line.size() && line[paramStart] == ' ') {
+            paramStart++;
+        }
         
         // Handle trailing parameter (starts with :)
-        size_t colonPos = paramsStr.find(" :");
-        if (colonPos != std::string::npos) {
-            std::string normalParams = paramsStr.substr(0, colonPos);
-            std::string trailingParam = paramsStr.substr(colonPos + 2);
-            
-            // Split normal parameters
+        size_t trailingStart = line.find(" :", paramStart);
+        if (trailingStart != std::string::npos) {
+            // Extract space-separated parameters before the trailing parameter
+            std::string normalParams = line.substr(paramStart, trailingStart - paramStart);
             if (!normalParams.empty()) {
-                std::vector<std::string> normalParamList = split(normalParams, ' ');
-                params.insert(params.end(), normalParamList.begin(), normalParamList.end());
+                std::istringstream iss(normalParams);
+                std::string param;
+                while (iss >> param) {
+                    params.push_back(param);
+                }
             }
             
             // Add trailing parameter
-            params.push_back(trailingParam);
+            params.push_back(line.substr(trailingStart + 2));
         } else {
-            // Split all parameters
-            params = split(paramsStr, ' ');
+            // Extract all space-separated parameters
+            std::istringstream iss(line.substr(paramStart));
+            std::string param;
+            while (iss >> param) {
+                params.push_back(param);
+            }
         }
     }
     
@@ -203,6 +210,30 @@ void Client::processData() {
     
     // Handle the command
     handleCommand(command, params);
+}
+
+void Client::processData() {
+    size_t pos;
+    // Process as many complete commands as possible
+    while ((pos = _buffer.find("\r\n")) != std::string::npos) {
+        std::string line = _buffer.substr(0, pos);
+        _buffer.erase(0, pos + 2); // Remove processed command
+        
+        // Skip empty lines
+        if (line.empty()) {
+            continue;
+        }
+        
+        // Parse and handle command
+        parseAndHandleCommand(line);
+    }
+    
+    // Handle buffer overflow protection - if buffer gets too large without
+    // finding a \r\n, the client might be sending malformed data
+    if (_buffer.size() > 8192) { // 8KB limit
+        sendData("ERROR :Client exceeded buffer size limit");
+        _buffer.clear();
+    }
 }
 
 void Client::handleCommand(const std::string& command, const std::vector<std::string>& params) {
