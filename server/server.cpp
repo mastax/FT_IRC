@@ -82,6 +82,43 @@ bool Server::setup() {
     return true;
 }
 
+void Server::addClient(int clientFd) {
+    // Create new client and add to map
+    Client* client = new Client(clientFd, this);
+    _clients[clientFd] = client;
+    
+    // Record connection time
+    _connectionTimes[clientFd] = time(NULL);
+    
+    // Add to poll array
+    pollfd clientPollFd;
+    clientPollFd.fd = clientFd;
+    clientPollFd.events = POLLIN;
+    _pollfds.push_back(clientPollFd);
+}
+
+void Server::checkTimeouts() {
+    time_t now = time(NULL);
+    std::vector<int> toRemove;
+    
+    for (std::map<int, time_t>::iterator it = _connectionTimes.begin(); 
+         it != _connectionTimes.end(); ++it) {
+        Client* client = getClient(it->first);
+        if (client && !client->isAuthenticated() && (now - it->second) > 60) {
+            // 60 seconds to complete registration
+            toRemove.push_back(it->first);
+        }
+    }
+    
+    for (size_t i = 0; i < toRemove.size(); i++) {
+        Client* client = getClient(toRemove[i]);
+        if (client) {
+            client->sendData("ERROR :Registration timeout");
+        }
+        removeClient(toRemove[i]);
+    }
+}
+
 // In Server class, add a method to check and remove disconnected clients
 void Server::checkAndRemoveDisconnectedClients() {
     std::vector<int> clientsToRemove;
@@ -99,60 +136,37 @@ void Server::checkAndRemoveDisconnectedClients() {
     }
 }
 
-// Add to Client class:
-void Client::sendPendingData() {
-    while (!_outgoingMessages.empty()) {
-        std::string& message = _outgoingMessages.front();
-        
-        ssize_t bytesSent = send(_fd, message.c_str(), message.size(), 0);
-        
-        if (bytesSent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Would block, try again later
-                return;
-            }
-            // Error sending data
-            std::cerr << "Error sending data: " << strerror(errno) << std::endl;
-            setDisconnected();
-            return;
-        }
-        else if (static_cast<size_t>(bytesSent) < message.size()) {
-            // Partial send - keep remaining data
-            message = message.substr(bytesSent);
-            return;
-        }
-        else {
-            // Full message sent
-            _outgoingMessages.pop();
-        }
-    }
-}
-
-// Modify Server::run() to include checking for disconnected clients
 void Server::run() {
     while (true) {
-        // Wait for activity on sockets
+        // Add this block right before poll() to set POLLOUT when needed
+        for (size_t i = 1; i < _pollfds.size(); i++) {
+            Client* client = getClient(_pollfds[i].fd);
+            if (client && client->hasPendingMessages()) {
+                _pollfds[i].events = POLLIN | POLLOUT;  // Enable write notifications
+            } else {
+                _pollfds[i].events = POLLIN;  // Only interested in reads
+            }
+        }
+
+        // Original poll() call remains here
         int activity = poll(&_pollfds[0], _pollfds.size(), -1);
         
         if (activity < 0) {
             if (errno == EINTR) {
-                // Interrupted by signal, just continue
                 continue;
             }
             std::cerr << "Poll error: " << strerror(errno) << std::endl;
             break;
         }
         
-        // Process server socket (new connections)
+        // Rest of your existing code remains exactly the same
         if (_pollfds[0].revents & POLLIN) {
             handleNewConnection();
         }
         
-        // Process client sockets
         for (size_t i = 1; i < _pollfds.size(); i++) {
             int fd = _pollfds[i].fd;
             
-            // Check for errors or hangup
             if (_pollfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
                 Client* client = getClient(fd);
                 if (client) {
@@ -161,12 +175,10 @@ void Server::run() {
                 continue;
             }
             
-            // Check for data to read
             if (_pollfds[i].revents & POLLIN) {
                 handleClientData(fd);
             }
             
-            // Check for ability to write (if client has pending data)
             if (_pollfds[i].revents & POLLOUT) {
                 Client* client = getClient(fd);
                 if (client) {
@@ -175,10 +187,61 @@ void Server::run() {
             }
         }
         
-        // Check and cleanup disconnected clients
         checkAndRemoveDisconnectedClients();
     }
 }
+
+// // Modify Server::run() to include checking for disconnected clients
+// void Server::run() {
+//     while (true) {
+//         // Wait for activity on sockets
+//         int activity = poll(&_pollfds[0], _pollfds.size(), -1);
+        
+//         if (activity < 0) {
+//             if (errno == EINTR) {
+//                 // Interrupted by signal, just continue
+//                 continue;
+//             }
+//             std::cerr << "Poll error: " << strerror(errno) << std::endl;
+//             break;
+//         }
+        
+//         // Process server socket (new connections)
+//         if (_pollfds[0].revents & POLLIN) {
+//             handleNewConnection();
+//         }
+        
+//         // Process client sockets
+//         for (size_t i = 1; i < _pollfds.size(); i++) {
+//             int fd = _pollfds[i].fd;
+            
+//             // Check for errors or hangup
+//             if (_pollfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+//                 Client* client = getClient(fd);
+//                 if (client) {
+//                     client->setDisconnected();
+//                 }
+//                 continue;
+//             }
+            
+//             // Check for data to read
+//             if (_pollfds[i].revents & POLLIN) {
+//                 handleClientData(fd);
+//             }
+            
+//             // Check for ability to write (if client has pending data)
+//             if (_pollfds[i].revents & POLLOUT) {
+//                 Client* client = getClient(fd);
+//                 if (client) {
+//                     client->sendPendingData();
+//                 }
+//             }
+//         }
+        
+//         // Check and cleanup disconnected clients
+//         checkAndRemoveDisconnectedClients();
+//     }
+// }
 
 void Server::stop() {
     // Close server socket
@@ -188,17 +251,17 @@ void Server::stop() {
     }
 }
 
-void Server::addClient(int clientFd) {
-    // Create new client and add to map
-    Client* client = new Client(clientFd, this);
-    _clients[clientFd] = client;
+// void Server::addClient(int clientFd) {
+//     // Create new client and add to map
+//     Client* client = new Client(clientFd, this);
+//     _clients[clientFd] = client;
     
-    // Add to poll array
-    pollfd clientPollFd;
-    clientPollFd.fd = clientFd;
-    clientPollFd.events = POLLIN;
-    _pollfds.push_back(clientPollFd);
-}
+//     // Add to poll array
+//     pollfd clientPollFd;
+//     clientPollFd.fd = clientFd;
+//     clientPollFd.events = POLLIN;
+//     _pollfds.push_back(clientPollFd);
+// }
 
 void Server::removeClient(int clientFd) {
     std::map<int, Client*>::iterator it = _clients.find(clientFd);

@@ -23,14 +23,16 @@ private:
     std::vector<pollfd>     _pollfds;           // Collection of file descriptors for poll()
     std::map<int, Client*>  _clients;           // Connected clients (fd -> Client)
     std::map<std::string, Channel*> _channels;  // Available channels (name -> Channel)
+     bool _disconnected;
 
 public:
     Server(unsigned int port, const std::string& password);
     ~Server();
 
+    void checkAndRemoveDisconnectedClients();
     // Prevent copying
-    Server(const Server& other) = delete;
-    Server& operator=(const Server& other) = delete;
+    Server(const Server& other);
+    Server& operator=(const Server& other);
 
     // Server operations
     bool setup();
@@ -49,12 +51,17 @@ public:
 
     // Password verification
     bool checkPassword(const std::string& password) const;
-
-private:
-    // Helper functions
     void handleNewConnection();
     void handleClientData(int clientFd);
     bool setNonBlocking(int fd);
+    bool isDisconnected() const {
+        return _disconnected;
+    }
+    
+    void setDisconnected() {
+        _disconnected = true;
+    }
+    // Helper functions
 };
 
 #endif // SERVER_HPP
@@ -66,11 +73,14 @@ private:
 #include <string>
 #include <vector>
 #include <map>
+#include <queue>
 
 class Server;
 class Channel;
+// Add in Client class declaration, at the beginning of the class:
 
 class Client {
+// friend class Server; // Add this line to allow Server to access private members
 private:
     int _fd;                    // Client socket file descriptor
     Server* _server;            // Reference to server
@@ -81,6 +91,8 @@ private:
     bool _authenticated;        // Whether client is authenticated
     std::vector<Channel*> _channels;  // Channels the client has joined
     bool _isOperator;           // Whether client is a server operator
+    bool _disconnected;
+    std::queue<std::string> _outgoingMessages; // For messages waiting to be sent
 
 public:
     Client(int fd, Server* server);
@@ -110,15 +122,26 @@ public:
     // Data handling
     bool receiveData();
     void sendData(const std::string& message);
+    void sendPendingData();
+    bool isDisconnected() const {
+        return _disconnected;
+    }
+    
+    void setDisconnected() {
+        _disconnected = true;
+    }
 
 private:
     // Process received data
     void processData();
     // Handle different IRC commands
     void handleCommand(const std::string& command, const std::vector<std::string>& params);
+    void parseAndHandleCommand(const std::string& line);
+
 };
 
 #endif // CLIENT_HPP
+
 
 #ifndef CHANNEL_HPP
 #define CHANNEL_HPP
@@ -186,67 +209,6 @@ public:
 
 #endif // CHANNEL_HPP
 
-#include "server/server.hpp"
-#include <iostream>
-#include <cstdlib>
-#include <signal.h>
-
-Server* g_server = NULL; // Global pointer for signal handling
-
-void signalHandler(int signum) {
-    std::cout << "\nSignal (" << signum << ") received. Shutting down server..." << std::endl;
-    if (g_server) {
-        g_server->stop();
-    }
-    exit(signum);
-}
-
-int main(int argc, char* argv[]) {
-    // Check arguments
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <port> <password>" << std::endl;
-        return 1;
-    }
-    
-    // Parse port number
-    int port;
-    try {
-        port = std::atoi(argv[1]);
-        if (port <= 0 || port > 65535) {
-            throw std::out_of_range("Port must be between 1 and 65535");
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "Invalid port number: " << e.what() << std::endl;
-        return 1;
-    }
-    
-    // Get password
-    std::string password = argv[2];
-    
-    // Set up signal handling for clean shutdown
-    signal(SIGINT, signalHandler);
-    signal(SIGTERM, signalHandler);
-    
-    // Create and set up server
-    try {
-        Server server(port, password);
-        g_server = &server;
-        
-        if (!server.setup()) {
-            std::cerr << "Failed to set up server" << std::endl;
-            return 1;
-        }
-        
-        std::cout << "Server started on port " << port << std::endl;
-        server.run();
-    } catch (const std::exception& e) {
-        std::cerr << "Server error: " << e.what() << std::endl;
-        return 1;
-    }
-    
-    return 0;
-}
-
 #include "server.hpp"
 #include "../client/client.hpp"
 #include "../channels/channels.hpp"
@@ -282,9 +244,9 @@ bool Server::setup() {
     // Create socket
     _serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (_serverSocket == -1) {
-        std::cerr << "Error creating socket" << std::endl;
-        return false;
-    }
+        std::cerr << "Error creating socket: " << strerror(errno) << std::endl;
+    return false;
+}
 
     // Set socket options to reuse address
     int opt = 1;
@@ -331,38 +293,101 @@ bool Server::setup() {
     return true;
 }
 
+// In Server class, add a method to check and remove disconnected clients
+void Server::checkAndRemoveDisconnectedClients() {
+    std::vector<int> clientsToRemove;
+    
+    // First, identify clients that need to be removed
+    for (std::map<int, Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it) {
+        if (it->second->isDisconnected()) {
+            clientsToRemove.push_back(it->first);
+        }
+    }
+    
+    // Then remove them
+    for (size_t i = 0; i < clientsToRemove.size(); i++) {
+        removeClient(clientsToRemove[i]);
+    }
+}
+
+// Add to Client class:
+void Client::sendPendingData() {
+    while (!_outgoingMessages.empty()) {
+        std::string& message = _outgoingMessages.front();
+        
+        ssize_t bytesSent = send(_fd, message.c_str(), message.size(), 0);
+        
+        if (bytesSent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Would block, try again later
+                return;
+            }
+            // Error sending data
+            std::cerr << "Error sending data: " << strerror(errno) << std::endl;
+            setDisconnected();
+            return;
+        }
+        else if (static_cast<size_t>(bytesSent) < message.size()) {
+            // Partial send - keep remaining data
+            message = message.substr(bytesSent);
+            return;
+        }
+        else {
+            // Full message sent
+            _outgoingMessages.pop();
+        }
+    }
+}
+
+// Modify Server::run() to include checking for disconnected clients
 void Server::run() {
     while (true) {
-        // Wait for activity on one of the sockets (timeout -1 means wait indefinitely)
+        // Wait for activity on sockets
         int activity = poll(&_pollfds[0], _pollfds.size(), -1);
         
         if (activity < 0) {
-            std::cerr << "Poll error" << std::endl;
+            if (errno == EINTR) {
+                // Interrupted by signal, just continue
+                continue;
+            }
+            std::cerr << "Poll error: " << strerror(errno) << std::endl;
             break;
         }
         
-        // Check if there's activity on the server socket (new connection)
+        // Process server socket (new connections)
         if (_pollfds[0].revents & POLLIN) {
             handleNewConnection();
         }
         
-        // Check client sockets for activity
+        // Process client sockets
         for (size_t i = 1; i < _pollfds.size(); i++) {
-            if (_pollfds[i].revents & POLLIN) {
-                // Data available to read
-                handleClientData(_pollfds[i].fd);
+            int fd = _pollfds[i].fd;
+            
+            // Check for errors or hangup
+            if (_pollfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                Client* client = getClient(fd);
+                if (client) {
+                    client->setDisconnected();
+                }
+                continue;
             }
             
-            if (_pollfds[i].revents & POLLHUP) {
-                // Client disconnected
-                std::cout << "Client disconnected" << std::endl;
-                removeClient(_pollfds[i].fd);
-
-                // Remove from poll array
-                _pollfds.erase(_pollfds.begin() + i);
-                i--; // Adjust index after removal
+            // Check for data to read
+            if (_pollfds[i].revents & POLLIN) {
+                handleClientData(fd);
+            }
+            
+            // Check for ability to write (if client has pending data)
+            if (_pollfds[i].revents & POLLOUT) {
+                Client* client = getClient(fd);
+                if (client) {
+                    client->sendPendingData();
+                }
             }
         }
+        
+        // Check and cleanup disconnected clients
+        checkAndRemoveDisconnectedClients();
     }
 }
 
@@ -387,15 +412,48 @@ void Server::addClient(int clientFd) {
 }
 
 void Server::removeClient(int clientFd) {
-    // Find client in map
     std::map<int, Client*>::iterator it = _clients.find(clientFd);
     if (it != _clients.end()) {
+        // Get client's channels before deletion
+        const std::vector<Channel*>& channels = it->second->getChannels();
+        
+        // Make a copy since the vector will be modified during channel operations
+        std::vector<Channel*> channelsCopy(channels.begin(), channels.end());
+        
+        // Notify each channel about the client leaving
+        for (std::vector<Channel*>::iterator chanIt = channelsCopy.begin(); 
+             chanIt != channelsCopy.end(); ++chanIt) {
+            
+            Channel* channel = *chanIt;
+            // Broadcast quit message to channel members
+            channel->broadcastMessage(":" + it->second->getNickname() + 
+                                   "!" + it->second->getUsername() + 
+                                   "@host QUIT :Connection closed");
+            
+            // Remove client from channel
+            it->second->leaveChannel(channel);
+            
+            // If channel becomes empty, remove it
+            if (channel->getClients().empty()) {
+                removeChannel(channel->getName());
+            }
+        }
+        
+        // Delete client object
         delete it->second;
         _clients.erase(it);
     }
     
     // Close socket
     close(clientFd);
+    
+    // Remove from poll array
+    for (size_t i = 0; i < _pollfds.size(); i++) {
+        if (_pollfds[i].fd == clientFd) {
+            _pollfds.erase(_pollfds.begin() + i);
+            break;
+        }
+    }
 }
 
 Client* Server::getClient(int clientFd) {
@@ -446,9 +504,13 @@ void Server::handleNewConnection() {
     int clientFd = accept(_serverSocket, (struct sockaddr*)&clientAddr, &clientAddrLen);
     
     if (clientFd < 0) {
-        std::cerr << "Error accepting connection" << std::endl;
-        return;
+    // Handle EAGAIN/EWOULDBLOCK separately as they're expected for non-blocking sockets
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return; // No connections available, not an error
     }
+    std::cerr << "Error accepting connection: " << strerror(errno) << std::endl;
+    return;
+}
     
     // Set non-blocking mode
     if (!setNonBlocking(clientFd)) {
@@ -493,6 +555,7 @@ bool Server::setNonBlocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
 }
 
+
 #include "client.hpp"
 #include "../server/server.hpp"
 #include "../channels/channels.hpp"
@@ -501,6 +564,7 @@ bool Server::setNonBlocking(int fd) {
 #include <algorithm>
 #include <unistd.h>
 #include <cstring>
+
 
 // Utility function to split a string by delimiters
 std::vector<std::string> split(const std::string& s, char delimiter) {
@@ -514,8 +578,9 @@ std::vector<std::string> split(const std::string& s, char delimiter) {
 }
 
 Client::Client(int fd, Server* server)
-    : _fd(fd), _server(server), _authenticated(false), _isOperator(false) {
-}
+        : _fd(fd), _server(server), _authenticated(false), _isOperator(false), _disconnected(false) {
+    }
+    
 
 Client::~Client() {
     // Leave all channels
@@ -593,15 +658,18 @@ const std::vector<Channel*>& Client::getChannels() const {
 }
 
 bool Client::receiveData() {
-    char buffer[1024];
+    char buffer[4096]; // Larger buffer
     ssize_t bytesRead = recv(_fd, buffer, sizeof(buffer) - 1, 0);
     
     if (bytesRead <= 0) {
         if (bytesRead == 0) {
             // Connection closed
-            std::cout << "Client disconnected" << std::endl;
+            std::cout << "Client " << _nickname << " disconnected" << std::endl;
         } else {
-            // Error
+            // Error reading
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return true; // Not an error, just no data available
+            }
             std::cerr << "Error receiving data: " << strerror(errno) << std::endl;
         }
         return false;
@@ -610,87 +678,100 @@ bool Client::receiveData() {
     buffer[bytesRead] = '\0';
     _buffer += buffer;
     
-    // Process commands that end with \r\n
-    size_t pos;
-    while ((pos = _buffer.find("\r\n")) != std::string::npos) {
-        std::string command = _buffer.substr(0, pos);
-        _buffer.erase(0, pos + 2); // Remove command and \r\n from buffer
-        
-        std::cout << "Received command: " << command << std::endl;
-        processData();
-    }
+    // In receiveData():
+    std::cout << "Received data: " << buffer << std::endl;
+    
+    // Process complete commands
+    processData();
     
     return true;
 }
 
 void Client::sendData(const std::string& message) {
     std::string fullMessage = message + "\r\n";
+    // In Client::sendData()
     ssize_t bytesSent = send(_fd, fullMessage.c_str(), fullMessage.size(), 0);
-    
-    if (bytesSent < 0) {
-        std::cerr << "Error sending data to client" << std::endl;
-    }
-}
+    // std::cout << "Sending: " << fullMessage << " (Bytes: " << bytesSent << ")" << std::endl;
 
-void Client::processData() {
-    // Example of processing IRC commands
-    // This is simplified - you'd need to implement RFC 1459 properly
-    
-    size_t pos = _buffer.find("\r\n");
-    if (pos == std::string::npos) {
-        return; // No complete command yet
-    }
-    
-    std::string line = _buffer.substr(0, pos);
-    _buffer.erase(0, pos + 2); // Remove processed command
-    
-    // Skip empty lines
-    if (line.empty()) {
+    if (bytesSent < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // Would block, need to buffer this message for later sending
+        // Add to outgoing message queue (implement this)
+        // To this:
+        _outgoingMessages.push(fullMessage);
         return;
     }
-    
+    std::cerr << "Error sending data to client: " << strerror(errno) << std::endl;
+    // Consider flagging client for disconnection
+    return;
+    }
+    else if (static_cast<size_t>(bytesSent) < fullMessage.size()) {
+    // Partial send - buffer remaining data
+    _outgoingMessages.push(fullMessage.substr(bytesSent));
+    // In parseAndHandleCommand() after extracting the command:
+}
+}
+
+void Client::parseAndHandleCommand(const std::string& line) {
     // Parse command
+    std::string prefix = "";
     std::string command;
     std::vector<std::string> params;
     
+    // Extract prefix if present
+    size_t start = 0;
     if (line[0] == ':') {
-        // Command with prefix (we'll ignore the prefix for now)
-        size_t spacePos = line.find(' ');
-        if (spacePos == std::string::npos) {
+        size_t prefixEnd = line.find(' ');
+        if (prefixEnd == std::string::npos) {
             return; // Invalid format
         }
-        
-        line = line.substr(spacePos + 1);
+        prefix = line.substr(1, prefixEnd - 1);
+        start = prefixEnd + 1;
+        while (start < line.size() && line[start] == ' ') {
+            start++;
+        }
     }
     
     // Extract command
-    size_t spacePos = line.find(' ');
-    if (spacePos == std::string::npos) {
-        command = line;
+    size_t cmdEnd = line.find(' ', start);
+    if (cmdEnd == std::string::npos) {
+        command = line.substr(start);
     } else {
-        command = line.substr(0, spacePos);
+        command = line.substr(start, cmdEnd - start);
+        // std::cout << "Processing command: " << command << std::endl;
         
         // Extract parameters
-        std::string paramsStr = line.substr(spacePos + 1);
+        size_t paramStart = cmdEnd + 1;
+        while (paramStart < line.size() && line[paramStart] == ' ') {
+            paramStart++;
+        }
         
         // Handle trailing parameter (starts with :)
-        size_t colonPos = paramsStr.find(" :");
-        if (colonPos != std::string::npos) {
-            std::string normalParams = paramsStr.substr(0, colonPos);
-            std::string trailingParam = paramsStr.substr(colonPos + 2);
-            
-            // Split normal parameters
+        size_t trailingStart = line.find(" :", paramStart);
+        if (trailingStart != std::string::npos) {
+            // Extract space-separated parameters before the trailing parameter
+            std::string normalParams = line.substr(paramStart, trailingStart - paramStart);
             if (!normalParams.empty()) {
-                std::vector<std::string> normalParamList = split(normalParams, ' ');
-                params.insert(params.end(), normalParamList.begin(), normalParamList.end());
+                std::istringstream iss(normalParams);
+                std::string param;
+                while (iss >> param) {
+                    params.push_back(param);
+                }
             }
             
             // Add trailing parameter
-            params.push_back(trailingParam);
+            params.push_back(line.substr(trailingStart + 2));
         } else {
-            // Split all parameters
-            params = split(paramsStr, ' ');
+            // Extract all space-separated parameters
+            std::istringstream iss(line.substr(paramStart));
+            std::string param;
+            while (iss >> param) {
+                params.push_back(param);
+            }
         }
+        
+        // In parseAndHandleCommand():
+    
     }
     
     // Convert command to uppercase for case-insensitive comparison
@@ -700,10 +781,34 @@ void Client::processData() {
     handleCommand(command, params);
 }
 
+void Client::processData() {
+    size_t pos;
+    // Process as many complete commands as possible
+    while ((pos = _buffer.find("\r\n")) != std::string::npos) {
+        std::string line = _buffer.substr(0, pos);
+        _buffer.erase(0, pos + 2); // Remove processed command
+        
+        // Skip empty lines
+        if (line.empty()) {
+            continue;
+        }
+        
+        // Parse and handle command
+        parseAndHandleCommand(line);
+    }
+    
+    // Handle buffer overflow protection - if buffer gets too large without
+    // finding a \r\n, the client might be sending malformed data
+    if (_buffer.size() > 8192) { // 8KB limit
+        sendData("ERROR :Client exceeded buffer size limit");
+        _buffer.clear();
+    }
+}
+
 void Client::handleCommand(const std::string& command, const std::vector<std::string>& params) {
     // This is where you'd implement handling of different IRC commands
     // For now, just print the command and parameters
-    
+    bool _passwordValidated = false;
     std::cout << "Command: " << command << std::endl;
     std::cout << "Parameters: ";
     for (size_t i = 0; i < params.size(); i++) {
@@ -714,17 +819,19 @@ void Client::handleCommand(const std::string& command, const std::vector<std::st
     // Basic command handling examples:
     if (command == "PASS") {
         // Password authentication
+        if (_server->checkPassword(params[0])) {
+            _passwordValidated = true;
+            std::cout << "hello\n";
+            // They need to provide NICK and USER as well
+        } else {
+            sendData("464 :Password incorrect");
+        }
         if (params.size() < 1) {
             sendData("461 " + _nickname + " PASS :Not enough parameters");
             return;
         }
         
-        if (_server->checkPassword(params[0])) {
             // Password accepted, but client is not fully registered yet
-            // They need to provide NICK and USER as well
-        } else {
-            sendData("464 :Password incorrect");
-        }
     }
     // Add this to Client::handleCommand
     else if (command == "TOPIC") {
@@ -795,10 +902,11 @@ void Client::handleCommand(const std::string& command, const std::vector<std::st
         // params[1] and params[2] are mode and unused
         // params[3] is the real name
         
+
         // If we have both nickname and username, complete registration
-        if (!_nickname.empty() && !_username.empty()) {
+        if (!_nickname.empty() && !_username.empty() && _passwordValidated) {
             _authenticated = true;
-            
+            std::cout << "HELLO\n";
             // Send welcome messages
             sendData("001 " + _nickname + " :Welcome to the Internet Relay Network " + _nickname + "!" + _username + "@host");
             sendData("002 " + _nickname + " :Your host is ft_irc, running version 1.0");
@@ -845,7 +953,240 @@ void Client::handleCommand(const std::string& command, const std::vector<std::st
         sendData("353 " + _nickname + " = " + channelName + " :" + channel->getNamesList());
         sendData("366 " + _nickname + " " + channelName + " :End of /NAMES list");
     }
+    // // In handleCommand() for each command handler:
+    // std::cout << "Handling PASS command" << std::endl;
     // Add more command handlers here (PRIVMSG, PART, QUIT, etc.)
 
 }
+#include "channels.hpp"
+#include "../client/client.hpp"
+#include <algorithm>
+#include <sstream>
 
+Channel::Channel(const std::string& name, Client* creator)
+    : _name(name), _userLimit(0), _inviteOnly(false), _topicRestricted(true) {
+    // Add creator as first client and operator
+    addClient(creator);
+    addOperator(creator);
+}
+
+Channel::~Channel() {
+    // Remove all clients from the channel
+    std::vector<Client*> clientsCopy = _clients;
+    for (std::vector<Client*>::iterator it = clientsCopy.begin(); it != clientsCopy.end(); ++it) {
+        (*it)->leaveChannel(this);
+    }
+    _clients.clear();
+    _operators.clear();
+    _invitedUsers.clear();
+}
+
+const std::string& Channel::getName() const {
+    return _name;
+}
+
+const std::string& Channel::getTopic() const {
+    return _topic;
+}
+
+const std::string& Channel::getPassword() const {
+    return _password;
+}
+
+unsigned int Channel::getUserLimit() const {
+    return _userLimit;
+}
+
+bool Channel::isInviteOnly() const {
+    return _inviteOnly;
+}
+
+bool Channel::isTopicRestricted() const {
+    return _topicRestricted;
+}
+
+void Channel::addClient(Client* client) {
+    if (!hasClient(client)) {
+        _clients.push_back(client);
+    }
+}
+
+void Channel::removeClient(Client* client) {
+    std::vector<Client*>::iterator it = std::find(_clients.begin(), _clients.end(), client);
+    if (it != _clients.end()) {
+        _clients.erase(it);
+    }
+    
+    // Also remove from operators if they were one
+    removeOperator(client);
+    
+    // If channel is empty, it should be deleted
+    // This will be handled by the Server class
+}
+
+bool Channel::hasClient(Client* client) const {
+    return std::find(_clients.begin(), _clients.end(), client) != _clients.end();
+}
+
+const std::vector<Client*>& Channel::getClients() const {
+    return _clients;
+}
+
+void Channel::addOperator(Client* client) {
+    // Only add as operator if they are in the channel
+    if (hasClient(client)) {
+        _operators.insert(client);
+    }
+}
+
+void Channel::removeOperator(Client* client) {
+    _operators.erase(client);
+}
+
+bool Channel::isOperator(Client* client) const {
+    return _operators.find(client) != _operators.end();
+}
+
+void Channel::addInvite(Client* client) {
+    _invitedUsers.insert(client);
+}
+
+bool Channel::isInvited(Client* client) const {
+    return _invitedUsers.find(client) != _invitedUsers.end();
+}
+
+void Channel::setTopic(const std::string& topic) {
+    _topic = topic;
+}
+
+void Channel::setPassword(const std::string& password) {
+    _password = password;
+}
+
+void Channel::setUserLimit(unsigned int limit) {
+    _userLimit = limit;
+}
+
+void Channel::setInviteOnly(bool inviteOnly) {
+    _inviteOnly = inviteOnly;
+}
+
+void Channel::setTopicRestricted(bool restricted) {
+    _topicRestricted = restricted;
+}
+
+void Channel::broadcastMessage(const std::string& message) {
+    for (std::vector<Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it) {
+        (*it)->sendData(message);
+    }
+}
+
+void Channel::broadcastMessage(const std::string& message, Client* except) {
+    for (std::vector<Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it) {
+        if (*it != except) {
+            (*it)->sendData(message);
+        }
+    }
+}
+
+std::string Channel::getNamesList() const {
+    std::stringstream ss;
+    
+    for (std::vector<Client*>::const_iterator it = _clients.begin(); it != _clients.end(); ++it) {
+        // Add @ for operators
+        if (isOperator(*it)) {
+            ss << "@";
+        }
+        
+        ss << (*it)->getNickname() << " ";
+    }
+    
+    return ss.str();
+}
+
+std::string Channel::getModeString() const {
+    std::string modes = "+";
+    std::string params = "";
+    
+    if (_inviteOnly) {
+        modes += "i";
+    }
+    
+    if (_topicRestricted) {
+        modes += "t";
+    }
+    
+    if (!_password.empty()) {
+        modes += "k";
+        params += " " + _password;
+    }
+    
+    if (_userLimit > 0) {
+        modes += "l";
+        std::stringstream ss;
+        ss << _userLimit;
+        params += " " + ss.str();
+    }
+    
+    return modes + params;
+}
+#include "server/server.hpp"
+#include <iostream>
+#include <cstdlib>
+#include <signal.h>
+
+Server* g_server = NULL; // Global pointer for signal handling
+
+void signalHandler(int signum) {
+    std::cout << "\nSignal (" << signum << ") received. Shutting down server..." << std::endl;
+    if (g_server) {
+        g_server->stop();
+    }
+    exit(signum);
+}
+
+int main(int argc, char* argv[]) {
+    // Check arguments
+    if (argc != 3) {
+        std::cerr << "Usage: " << argv[0] << " <port> <password>" << std::endl;
+        return 1;
+    }
+    
+    // Parse port number
+    int port;
+    try {
+        port = std::atoi(argv[1]);
+        if (port <= 0 || port > 65535) {
+            throw std::out_of_range("Port must be between 1 and 65535");
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Invalid port number: " << e.what() << std::endl;
+        return 1;
+    }
+    
+    // Get password
+    std::string password = argv[2];
+    
+    // Set up signal handling for clean shutdown
+    signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
+    
+    // Create and set up server
+    try {
+        Server server(port, password);
+        g_server = &server;
+        
+        if (!server.setup()) {
+            std::cerr << "Failed to set up server" << std::endl;
+            return 1;
+        }
+        
+        std::cout << "Server started on port " << port << std::endl;
+        server.run();
+    } catch (const std::exception& e) {
+        std::cerr << "Server error: " << e.what() << std::endl;
+        return 1;
+    }
+    
+    return 0;
+}

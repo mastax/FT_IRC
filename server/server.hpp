@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <ctime>
 
 class Client;
 class Channel;
@@ -23,13 +24,14 @@ private:
     std::vector<pollfd>     _pollfds;           // Collection of file descriptors for poll()
     std::map<int, Client*>  _clients;           // Connected clients (fd -> Client)
     std::map<std::string, Channel*> _channels;  // Available channels (name -> Channel)
+    std::map<int, time_t> _connectionTimes;  // Track when clients connected
      bool _disconnected;
 
 public:
     Server(unsigned int port, const std::string& password);
     ~Server();
 
-    void Server::checkAndRemoveDisconnectedClients();
+    void checkAndRemoveDisconnectedClients();
     // Prevent copying
     Server(const Server& other);
     Server& operator=(const Server& other);
@@ -61,6 +63,8 @@ public:
     void setDisconnected() {
         _disconnected = true;
     }
+    void checkTimeouts();
+    pollfd* getPollfd(int fd);
     // Helper functions
 };
 

@@ -5,11 +5,14 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <queue>
 
 class Server;
 class Channel;
+// Add in Client class declaration, at the beginning of the class:
 
 class Client {
+// friend class Server; // Add this line to allow Server to access private members
 private:
     int _fd;                    // Client socket file descriptor
     Server* _server;            // Reference to server
@@ -18,10 +21,11 @@ private:
     std::string _hostname;      // Client hostname
     std::string _buffer;        // Buffer for incoming data
     bool _authenticated;        // Whether client is authenticated
-    std::vector<Channel*> _channels;  // Channels the client has joined
     bool _isOperator;           // Whether client is a server operator
     bool _disconnected;
-    // std::queue<std::string> _outgoingMessages; // For messages waiting to be sent
+    // bool _passwordValidated;
+    std::vector<Channel*> _channels;  // Channels the client has joined
+    std::queue<std::string> _outgoingMessages; // For messages waiting to be sent
 
 public:
     Client(int fd, Server* server);
@@ -51,12 +55,7 @@ public:
     // Data handling
     bool receiveData();
     void sendData(const std::string& message);
-
-private:
-    // Process received data
-    void processData();
-    // Handle different IRC commands
-    void handleCommand(const std::string& command, const std::vector<std::string>& params);
+    void sendPendingData();
     bool isDisconnected() const {
         return _disconnected;
     }
@@ -64,7 +63,16 @@ private:
     void setDisconnected() {
         _disconnected = true;
     }
-    void Client::parseAndHandleCommand(const std::string& line);
+    bool hasPendingMessages() const { return !_outgoingMessages.empty(); }
+
+    void completeRegistration();
+
+private:
+    // Process received data
+    void processData();
+    // Handle different IRC commands
+    void handleCommand(const std::string& command, const std::vector<std::string>& params);
+    void parseAndHandleCommand(const std::string& line);
 
 };
 

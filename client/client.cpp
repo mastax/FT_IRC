@@ -23,7 +23,6 @@ Client::Client(int fd, Server* server)
         : _fd(fd), _server(server), _authenticated(false), _isOperator(false), _disconnected(false) {
     }
     
-
 Client::~Client() {
     // Leave all channels
     std::vector<Channel*> channelsCopy = _channels;
@@ -120,32 +119,100 @@ bool Client::receiveData() {
     buffer[bytesRead] = '\0';
     _buffer += buffer;
     
+    // In receiveData():
+    std::cout << "Received data: " << buffer << std::endl;
+    
     // Process complete commands
     processData();
     
     return true;
 }
 
+void Client::sendPendingData() {
+    while (!_outgoingMessages.empty()) {
+        std::string& message = _outgoingMessages.front();
+        
+        ssize_t bytesSent = send(_fd, message.c_str(), message.size(), -1);////////////////////////
+        
+        if (bytesSent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;  // Try again later
+            }
+            // Error case
+            setDisconnected();
+            return;
+        }
+        else if (static_cast<size_t>(bytesSent) < message.size()) {
+            // Keep remainder in queue
+            message = message.substr(bytesSent);
+            return;
+        }
+        else {
+            // Message fully sent
+            _outgoingMessages.pop();
+        }
+    }
+}
+
 void Client::sendData(const std::string& message) {
+    if (_disconnected) {
+        return;  // Don't try to send to disconnected clients
+    }
+
     std::string fullMessage = message + "\r\n";
-    // In Client::sendData()
-    ssize_t bytesSent = send(_fd, fullMessage.c_str(), fullMessage.size(), 0);
-    if (bytesSent < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        // Would block, need to buffer this message for later sending
-        // Add to outgoing message queue (implement this)
-            _outgoingMessages.push_back(fullMessage);
+    
+    // Try immediate send if no queued messages
+    if (_outgoingMessages.empty()) {
+        ssize_t bytesSent = send(_fd, fullMessage.c_str(), fullMessage.size(), -1);
+        
+        if (bytesSent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Socket buffer full, queue for later
+                _outgoingMessages.push(fullMessage);
+                return;
+            }
+            // Real error occurred
+            std::cerr << "Error sending to client " << _nickname << ": " << strerror(errno) << std::endl;
+            setDisconnected();
+            return;
+        }
+        else if (static_cast<size_t>(bytesSent) < fullMessage.size()) {
+            // Partial send, queue remainder
+            _outgoingMessages.push(fullMessage.substr(bytesSent));
+            return;
+        }
+        // Full message sent successfully
         return;
     }
-    std::cerr << "Error sending data to client: " << strerror(errno) << std::endl;
-    // Consider flagging client for disconnection
-    return;
-    }
-    else if (static_cast<size_t>(bytesSent) < fullMessage.size()) {
-    // Partial send - buffer remaining data
-    _outgoingMessages.push_back(fullMessage.substr(bytesSent));
+    
+    // Already have queued messages, just add to queue
+    _outgoingMessages.push(fullMessage);
 }
-}
+
+// void Client::sendData(const std::string& message) {
+//     std::string fullMessage = message + "\r\n";
+//     // In Client::sendData()
+//     ssize_t bytesSent = send(_fd, fullMessage.c_str(), fullMessage.size(), 0);
+//     // std::cout << "Sending: " << fullMessage << " (Bytes: " << bytesSent << ")" << std::endl;
+
+//     if (bytesSent < 0) {
+//         if (errno == EAGAIN || errno == EWOULDBLOCK) {
+//         // Would block, need to buffer this message for later sending
+//         // Add to outgoing message queue (implement this)
+//         // To this:
+//         _outgoingMessages.push(fullMessage);
+//         return;
+//     }
+//     std::cerr << "Error sending data to client: " << strerror(errno) << std::endl;
+//     // Consider flagging client for disconnection
+//     return;
+//     }
+//     else if (static_cast<size_t>(bytesSent) < fullMessage.size()) {
+//     // Partial send - buffer remaining data
+//     _outgoingMessages.push(fullMessage.substr(bytesSent));
+//     // In parseAndHandleCommand() after extracting the command:
+// }
+// }
 
 void Client::parseAndHandleCommand(const std::string& line) {
     // Parse command
@@ -173,6 +240,7 @@ void Client::parseAndHandleCommand(const std::string& line) {
         command = line.substr(start);
     } else {
         command = line.substr(start, cmdEnd - start);
+        // std::cout << "Processing command: " << command << std::endl;
         
         // Extract parameters
         size_t paramStart = cmdEnd + 1;
@@ -203,6 +271,9 @@ void Client::parseAndHandleCommand(const std::string& line) {
                 params.push_back(param);
             }
         }
+        
+        // In parseAndHandleCommand():
+    
     }
     
     // Convert command to uppercase for case-insensitive comparison
@@ -236,10 +307,23 @@ void Client::processData() {
     }
 }
 
+void Client::completeRegistration() {
+    _authenticated = true;
+    
+    // Send welcome messages
+    sendData("001 " + _nickname + " :Welcome to the Internet Relay Network " + _nickname + "!" + _username + "@host");
+    sendData("002 " + _nickname + " :Your host is ft_irc, running version 1.0");
+    sendData("003 " + _nickname + " :This server was created today");
+    sendData("004 " + _nickname + " ft_irc 1.0 o o");
+    
+    // MOTD would go here
+    sendData("422 " + _nickname + " :MOTD File is missing");
+}
+
 void Client::handleCommand(const std::string& command, const std::vector<std::string>& params) {
     // This is where you'd implement handling of different IRC commands
     // For now, just print the command and parameters
-    
+    bool _passwordValidated = false;
     std::cout << "Command: " << command << std::endl;
     std::cout << "Parameters: ";
     for (size_t i = 0; i < params.size(); i++) {
@@ -247,21 +331,33 @@ void Client::handleCommand(const std::string& command, const std::vector<std::st
     }
     std::cout << std::endl;
     
-    // Basic command handling examples:
-    if (command == "PASS") {
-        // Password authentication
-        if (params.size() < 1) {
-            sendData("461 " + _nickname + " PASS :Not enough parameters");
+    // First check for commands that require authentication
+    if (command == "JOIN" || command == "PRIVMSG" || command == "PART" || 
+        command == "MODE" || command == "TOPIC" || command == "INVITE") {
+        if (!_authenticated) {
+            sendData("451 :You have not registered");
             return;
         }
-        
-        if (_server->checkPassword(params[0])) {
-            // Password accepted, but client is not fully registered yet
-            // They need to provide NICK and USER as well
-        } else {
-            sendData("464 :Password incorrect");
-        }
     }
+    // Basic command handling examples:
+    if (command == "PASS") {
+    if (_authenticated) {
+        sendData("462 :You may not reregister");
+        return;
+    }
+    
+    if (params.size() < 1) {
+        sendData("461 PASS :Not enough parameters");
+        return;
+    }
+    
+    if (_server->checkPassword(params[0])) {
+        _passwordValidated = true;
+    } else {
+        sendData("464 :Password incorrect");
+        setDisconnected();
+    }
+}
     // Add this to Client::handleCommand
     else if (command == "TOPIC") {
         if (params.size() < 1) {
@@ -307,41 +403,91 @@ void Client::handleCommand(const std::string& command, const std::vector<std::st
     channel->broadcastMessage(":" + _nickname + "!" + _username + "@host TOPIC " + channelName + " :" + params[1]);
 }
     else if (command == "NICK") {
-        // Set nickname
-        if (params.size() < 1) {
-            sendData("431 :No nickname given");
-            return;
-        }
-        
-        std::string newNick = params[0];
-        // Check if nickname is valid and not already taken
-        // For simplicity, we're not implementing these checks here
-        
-        _nickname = newNick;
-        sendData(":" + _nickname + " NICK :" + _nickname);
+    if (params.size() < 1) {
+        sendData("431 :No nickname given");
+        return;
     }
+    
+    std::string newNick = params[0];
+    
+    // Validate nickname format
+    if (newNick.empty() || newNick.size() > 9 || 
+        newNick.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789[]\\`_^{|}") != std::string::npos) {
+        sendData("432 " + newNick + " :Erroneous nickname");
+        return;
+    }
+    
+    // TODO: Check if nickname is already in use
+    
+    _nickname = newNick;
+    
+    // If we have USER command and password, complete registration
+    if (!_username.empty() && _passwordValidated && !_authenticated) {
+        completeRegistration();
+    }
+}
+    // else if (command == "NICK") {
+    //     // Set nickname
+    //     if (params.size() < 1) {
+    //         sendData("431 :No nickname given");
+    //         return;
+    //     }
+        
+    //     std::string newNick = params[0];
+    //     // Check if nickname is valid and not already taken
+    //     // For simplicity, we're not implementing these checks here
+        
+    //     _nickname = newNick;
+    //     sendData(":" + _nickname + " NICK :" + _nickname);
+    // }
     else if (command == "USER") {
-        // Set username and realname
-        if (params.size() < 4) {
-            sendData("461 " + _nickname + " USER :Not enough parameters");
-            return;
-        }
-        
-        _username = params[0];
-        // params[1] and params[2] are mode and unused
-        // params[3] is the real name
-        
-        // If we have both nickname and username, complete registration
-        if (!_nickname.empty() && !_username.empty()) {
-            _authenticated = true;
-            
-            // Send welcome messages
-            sendData("001 " + _nickname + " :Welcome to the Internet Relay Network " + _nickname + "!" + _username + "@host");
-            sendData("002 " + _nickname + " :Your host is ft_irc, running version 1.0");
-            sendData("003 " + _nickname + " :This server was created today");
-            sendData("004 " + _nickname + " ft_irc 1.0 o o");
-        }
+    if (_authenticated) {
+        sendData("462 :You may not reregister");
+        return;
     }
+    
+    if (!_passwordValidated) {
+        sendData("464 :Password required");
+        return;
+    }
+    
+    if (params.size() < 4) {
+        sendData("461 USER :Not enough parameters");
+        return;
+    }
+    
+    _username = params[0];
+    // params[1] and params[2] are mode and unused
+    // params[3] is the real name
+    
+    // Complete registration if we have nickname
+    if (!_nickname.empty()) {
+        completeRegistration();
+    }
+}
+    // else if (command == "USER") {
+    //     // Set username and realname
+    //     if (params.size() < 4) {
+    //         sendData("461 " + _nickname + " USER :Not enough parameters");
+    //         return;
+    //     }
+        
+    //     _username = params[0];
+    //     // params[1] and params[2] are mode and unused
+    //     // params[3] is the real name
+        
+
+    //     // If we have both nickname and username, complete registration
+    //     if (!_nickname.empty() && !_username.empty() && _passwordValidated) {
+    //         _authenticated = true;
+    //         std::cout << "HELLO\n";
+    //         // Send welcome messages
+    //         sendData("001 " + _nickname + " :Welcome to the Internet Relay Network " + _nickname + "!" + _username + "@host");
+    //         sendData("002 " + _nickname + " :Your host is ft_irc, running version 1.0");
+    //         sendData("003 " + _nickname + " :This server was created today");
+    //         sendData("004 " + _nickname + " ft_irc 1.0 o o");
+    //     }
+    // }
     else if (command == "JOIN") {
         // Join a channel
         if (params.size() < 1) {
@@ -381,6 +527,8 @@ void Client::handleCommand(const std::string& command, const std::vector<std::st
         sendData("353 " + _nickname + " = " + channelName + " :" + channel->getNamesList());
         sendData("366 " + _nickname + " " + channelName + " :End of /NAMES list");
     }
+    // // In handleCommand() for each command handler:
+    // std::cout << "Handling PASS command" << std::endl;
     // Add more command handlers here (PRIVMSG, PART, QUIT, etc.)
 
 }
